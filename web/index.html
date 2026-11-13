@@ -25,7 +25,7 @@
 <body>
 <div id="hud">
   <div id="clock">--:--:--</div>
-  <div id="meta">住户：<span id="where">?</span> · 室外 <span id="outdoor">–</span> lx</div>
+  <div id="meta">住户：<span id="where">?</span> · 室外 <span id="outdoor">–</span> lx · 卧室窗帘 <span id="shutter">–</span></div>
   <table id="rooms"></table>
   <div id="conn" class="bad">连接中…</div>
 </div>
@@ -46,7 +46,19 @@ const ROOMS = {
 };
 const AWAY = { spot: [4.8, 10.5], door: [4.8, 8.0] };
 const LAMP_MAX = 1.8;                  // three.js intensity at brightness 255
-const DAYLIGHT_SCALE = 1.6 / 300;      // intensity per lux of daylight reaching the room
+// Light spans 0.1 to 100 000 lx; eyes (and these mappings) work roughly logarithmically.
+const log01 = (lux, lo, hi) => Math.min(Math.max((Math.log10(lux + 1) - lo) / (hi - lo), 0), 1);
+const daylightIntensity = lux => 2.0 * log01(lux, 0, Math.log10(1000));
+
+// Approximate RGB of a black body at `k` kelvin (Tanner Helland's fit), as a THREE.Color.
+function kelvinColor(k) {
+  const t = k / 100;
+  const r = t <= 66 ? 255 : 329.7 * Math.pow(t - 60, -0.1332);
+  const g = t <= 66 ? 99.47 * Math.log(t) - 161.12 : 288.12 * Math.pow(t - 60, -0.0755);
+  const b = t >= 66 ? 255 : t <= 19 ? 0 : 138.52 * Math.log(t - 10) - 305.04;
+  const c = v => Math.min(Math.max(v, 0), 255) / 255;
+  return new THREE.Color(c(r), c(g), c(b));
+}
 
 // ---------------------------------------------------------------- scene
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -127,6 +139,19 @@ wall(5.6, 0, 11, 0);                                 // living north
 wall(11, 0, 11, 6, [WIN(1.0, 5.0)]);                 // living east (big window)
 wall(5.6, 6, 11, 6, [WIN(1.5, 4.0)]);                // living south (window)
 
+// Bedroom Rollladen, outside the west window: a slat curtain that rolls down from a box above it.
+const SHUTTER = { x: -0.12, z: 2.25, width: 1.7, head: 2.1, sill: 0.9 };
+const slatMat = new THREE.MeshStandardMaterial({ color: 0x6b6f75, roughness: 0.7, metalness: 0.2 });
+const shutterMesh = box(0.04, 1, SHUTTER.width, SHUTTER.x, SHUTTER.head - 0.5, SHUTTER.z, slatMat);
+box(0.25, 0.22, SHUTTER.width + 0.1, SHUTTER.x - 0.05, SHUTTER.head + 0.11, SHUTTER.z, slatMat);  // roller box
+let shutterPos = 100, shutterShown = 100;
+function placeShutter(pos) {
+  const h = Math.max((SHUTTER.head - SHUTTER.sill) * (1 - pos / 100), 0.001);
+  shutterMesh.scale.y = h;
+  shutterMesh.position.y = SHUTTER.head - h / 2;
+}
+placeShutter(100);
+
 // Per room: floor, ceiling lamp, and a cool "window light" standing in for daylight.
 const roomViz = {};
 for (const [name, r] of Object.entries(ROOMS)) {
@@ -162,7 +187,7 @@ for (const [name, r] of Object.entries(ROOMS)) {
   day.shadow.bias = -0.004;
   scene.add(day);
 
-  roomViz[name] = { lamp, bulbMat, day, lampTarget: 0, dayTarget: 0 };
+  roomViz[name] = { lamp, bulbMat, day, lampTarget: 0, dayTarget: 0, color: kelvinColor(2700) };
 }
 
 // ---------------------------------------------------------------- occupant
@@ -192,16 +217,19 @@ function moveTo(room) {
 }
 
 // ---------------------------------------------------------------- state from MQTT
-const state = { t: null, outdoor: 0, lux: {}, light: {} };
+const state = { t: null, outdoor: 0, lux: {}, light: {}, asleep: false };
 const roomsTable = document.getElementById("rooms");
 function renderHud() {
   document.getElementById("clock").textContent =
     state.t == null ? "--:--:--" : new Date(state.t * 1000).toLocaleTimeString("zh-CN", { hour12: false });
   document.getElementById("outdoor").textContent = Math.round(state.outdoor);
-  document.getElementById("where").textContent = personRoom === "away" ? "外出" : ROOMS[personRoom].label;
+  document.getElementById("where").textContent =
+    (personRoom === "away" ? "外出" : ROOMS[personRoom].label) + (state.asleep ? "（睡着）" : "");
+  document.getElementById("shutter").textContent = `${Math.round(shutterPos)}%`;
   roomsTable.innerHTML = Object.entries(ROOMS).map(([name, r]) => {
     const l = state.light[name], lux = state.lux[name];
-    const cell = l && l.on ? `<td class="on">亮 ${Math.round(l.brightness / 2.55)}%</td>` : `<td class="off">灭</td>`;
+    const k = l && l.kelvin ? ` ${l.kelvin}K` : "";
+    const cell = l && l.on ? `<td class="on">亮 ${Math.round(l.brightness / 2.55)}%${k}</td>` : `<td class="off">灭</td>`;
     return `<tr><td>${r.label}</td>${cell}<td>${lux == null ? "–" : Math.round(lux)} lx</td></tr>`;
   }).join("");
 }
@@ -211,7 +239,7 @@ const conn = document.getElementById("conn");
 const client = mqtt.connect(broker, { reconnectPeriod: 2000, connectTimeout: 4000 });
 client.on("connect", () => {
   conn.className = "ok"; conn.textContent = broker;
-  client.subscribe(["home/+/light/state", "home/+/lux", "sim/time", "sim/occupant", "sim/ambient"]);
+  client.subscribe(["home/+/light/state", "home/+/lux", "home/+/shutter/state", "sim/time", "sim/occupant", "sim/ambient"]);
 });
 client.on("offline", () => { conn.className = "bad"; conn.textContent = `连不上 ${broker}（docker compose up -d 了吗？）`; });
 client.on("message", (topic, buf) => {
@@ -219,17 +247,18 @@ client.on("message", (topic, buf) => {
   try { p = JSON.parse(buf.toString()); } catch { return; }
   const parts = topic.split("/");
   if (topic === "sim/time") state.t = p.t;
-  else if (topic === "sim/occupant") moveTo(p.room);
+  else if (topic === "sim/occupant") { moveTo(p.room); state.asleep = !!p.asleep; }
   else if (topic === "sim/ambient") {
     state.outdoor = p.outdoor;
-    for (const [room, lux] of Object.entries(p.rooms || {})) if (roomViz[room]) roomViz[room].dayTarget = lux * DAYLIGHT_SCALE;
+    for (const [room, lux] of Object.entries(p.rooms || {})) if (roomViz[room]) roomViz[room].dayTarget = daylightIntensity(lux);
   } else if (parts[0] === "home" && roomViz[parts[1]]) {
     const room = parts[1];
     if (parts[2] === "lux") state.lux[room] = p.lux;
     else if (parts[2] === "light") {
       state.light[room] = p;
       roomViz[room].lampTarget = p.on ? (p.brightness / 255) * LAMP_MAX : 0;
-    }
+      if (p.kelvin) roomViz[room].color = kelvinColor(p.kelvin);
+    } else if (parts[2] === "shutter" && room === "bedroom") shutterPos = p.position;
   }
 });
 
@@ -243,10 +272,14 @@ function animate() {
 
   for (const v of Object.values(roomViz)) {
     v.lamp.intensity += (v.lampTarget - v.lamp.intensity) * k;
+    v.lamp.color.lerp(v.color, k);
+    v.bulbMat.emissive.copy(v.lamp.color);
     v.bulbMat.emissiveIntensity = v.lamp.intensity / LAMP_MAX * 2.5;
     v.day.intensity += (v.dayTarget - v.day.intensity) * k;
   }
-  const sun = Math.min(state.outdoor / 600, 1);
+  shutterShown += (shutterPos - shutterShown) * k;
+  placeShutter(shutterShown);
+  const sun = log01(state.outdoor, 1, 4.5);  // ~10 lx (dusk) .. ~30 000 lx (bright day)
   scene.background.copy(NIGHT_SKY).lerp(DAY_SKY, sun);
   hemi.intensity = 0.12 + 0.25 * sun;
   glassMat.emissiveIntensity = 0.05 + 0.9 * sun;

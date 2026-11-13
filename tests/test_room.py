@@ -13,13 +13,13 @@ def make(**kw) -> RoomController:
 def test_dark_motion_turns_on_full_by_day():
     rc = make()
     rc.on_lux(10, NOON)
-    assert rc.on_motion(True, NOON) == [LightCommand("hall", True, 255)]
+    assert rc.on_motion(True, NOON) == [LightCommand("hall", True, 255, 4000)]
 
 
 def test_dim_at_night():
     rc = make()
     rc.on_lux(0, MIDNIGHT)
-    assert rc.on_motion(True, MIDNIGHT) == [LightCommand("hall", True, 26)]
+    assert rc.on_motion(True, MIDNIGHT) == [LightCommand("hall", True, 26, 2200)]
 
 
 def test_bright_room_stays_off():
@@ -66,14 +66,14 @@ def test_reentry_right_after_off_uses_no_stale_lux():
     rc.on_motion(False, NOON + 2)
     rc.tick(NOON + 62)  # off
     rc.on_lux(300, NOON + 62.5)  # stale reading from before the lamp went dark
-    assert rc.on_motion(True, NOON + 63) == [LightCommand("hall", True, 255)]
+    assert rc.on_motion(True, NOON + 63) == [LightCommand("hall", True, 255, 4000)]
 
 
 def test_getting_dark_while_occupied_turns_on():
     rc = make()
     rc.on_lux(200, NOON)
     rc.on_motion(True, NOON)
-    assert rc.on_lux(30, NOON + 600) == [LightCommand("hall", True, 255)]
+    assert rc.on_lux(30, NOON + 600) == [LightCommand("hall", True, 255, 4000)]
 
 
 def test_manual_on_in_empty_room_still_times_out():

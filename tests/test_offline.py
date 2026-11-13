@@ -36,3 +36,17 @@ def test_full_day(seed):
         # The light reacts within a step of entering a dark room.
         assert m.dark_s <= 2 * world.lights[r].on_count + 5, r
     assert world.lights["hallway"].on_count > 0
+
+
+def test_sunrise_wakes_by_light_and_alarm_only_does_not():
+    winter = datetime(2026, 12, 21).timestamp()
+    by_light = {True: 0, False: 0}
+    for wake in (True, False):
+        for seed in range(5):
+            world = simulate(winter, 9, seed, wake=wake, status_every_s=None)
+            (rec,) = world.sleep_metrics.wakes
+            by_light[wake] += rec.cause == "light"
+            if not wake:
+                assert world.sleep_metrics.lux_at_alarm[rec.alarm] < 5  # dark room, dark outside
+            assert world.sleep_metrics.lit_sleep_s == 0  # the bedroom lamp never shines on the sleeper at night
+    assert by_light[True] >= 2 and by_light[False] == 0
