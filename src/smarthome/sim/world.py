@@ -7,7 +7,16 @@ import random
 from dataclasses import dataclass
 from datetime import datetime
 
-from smarthome.protocol import ROOMS, clock_str, light_set_topic, light_state_topic, lux_topic, motion_topic
+from smarthome.protocol import (
+    ROOMS,
+    SIM_AMBIENT,
+    SIM_OCCUPANT,
+    clock_str,
+    light_set_topic,
+    light_state_topic,
+    lux_topic,
+    motion_topic,
+)
 from smarthome.sim.occupant import Occupant
 
 # Fraction of window daylight reaching each room's lux sensor. The hallway has no window.
@@ -86,6 +95,7 @@ class World:
         self.location = "?"
         self._occupied: dict[str, bool | None] = {r: None for r in ROOMS}
         self._last_lux: dict[str, tuple[float, float]] = {r: (math.nan, -math.inf) for r in ROOMS}
+        self._last_ambient_t = -math.inf
 
     def ambient(self, room: str, ts: float) -> float:
         return self.daylight(ts) * WINDOW[room]
@@ -94,7 +104,16 @@ class World:
         return self.ambient(room, ts) + self.lights[room].lux
 
     def step(self, ts: float, dt: float) -> None:
-        self.location = self.occupant.location(ts)
+        loc = self.occupant.location(ts)
+        if loc != self.location:
+            self._bus.publish(SIM_OCCUPANT, {"room": loc}, retain=True)
+        self.location = loc
+        if ts - self._last_ambient_t >= 30:
+            self._last_ambient_t = ts
+            self._bus.publish(SIM_AMBIENT, {
+                "outdoor": round(self.daylight(ts), 1),
+                "rooms": {r: round(self.ambient(r, ts), 1) for r in ROOMS},
+            }, retain=True)
         for r in ROOMS:
             occ = self.location == r
             if occ != self._occupied[r]:

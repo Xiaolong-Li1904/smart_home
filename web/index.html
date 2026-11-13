@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Home View</title>
+<style>
+  :root { --panel: rgba(14, 17, 25, 0.84); --text: #e8e8e8; --muted: #8a8f9a; --on: #ffcf70; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0e14; color: var(--text);
+               font: 13px/1.45 system-ui, "Microsoft YaHei", sans-serif; }
+  canvas { display: block; }
+  #hud { position: absolute; top: 12px; left: 12px; background: var(--panel); padding: 10px 14px;
+         border-radius: 8px; min-width: 250px; backdrop-filter: blur(4px); }
+  #clock { font-size: 28px; font-variant-numeric: tabular-nums; letter-spacing: 0.5px; }
+  #meta { color: var(--muted); margin-bottom: 4px; }
+  table { border-collapse: collapse; width: 100%; }
+  td { padding: 2px 10px 2px 0; font-variant-numeric: tabular-nums; }
+  td:last-child { text-align: right; padding-right: 0; color: var(--muted); }
+  .on { color: var(--on); } .off { color: var(--muted); }
+  #conn { margin-top: 6px; font-size: 11px; color: var(--muted); }
+  #conn.ok::before { content: "● "; color: #6fcf7f; } #conn.bad::before { content: "● "; color: #e06c6c; }
+  #help { position: absolute; bottom: 10px; left: 12px; font-size: 11px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div id="clock">--:--:--</div>
+  <div id="meta">住户：<span id="where">?</span> · 室外 <span id="outdoor">–</span> lx</div>
+  <table id="rooms"></table>
+  <div id="conn" class="bad">连接中…</div>
+</div>
+<div id="help">左键拖动旋转 · 滚轮缩放 · 右键平移 · ?broker=ws://host:9001 可指定代理</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script>
+"use strict";
+
+// ---------------------------------------------------------------- layout (metres; x = east, z = south)
+const H = 2.6, T = 0.12;               // wall height, thickness
+const ROOMS = {
+  bedroom: { label: "卧室", x0: 0,   x1: 4,  z0: 0, z1: 4.5, floor: 0x8a6a4f, spot: [2.0, 2.6], door: [4.0, 3.45], win: [0.5, 1.6, 2.25] },
+  hallway: { label: "走廊", x0: 4,   x1: 5.6, z0: 0, z1: 8,   floor: 0x9a9a94, spot: [4.8, 4.2], door: null,        win: null },
+  living:  { label: "客厅", x0: 5.6, x1: 11, z0: 0, z1: 6,   floor: 0xb59f80, spot: [8.4, 3.0], door: [5.6, 1.45], win: [10.4, 1.6, 3.0] },
+};
+const AWAY = { spot: [4.8, 10.5], door: [4.8, 8.0] };
+const LAMP_MAX = 1.8;                  // three.js intensity at brightness 255
+const DAYLIGHT_SCALE = 1.6 / 300;      // intensity per lux of daylight reaching the room
+
+// ---------------------------------------------------------------- scene
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.outputEncoding = THREE.sRGBEncoding;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const NIGHT_SKY = new THREE.Color(0x0b0e14), DAY_SKY = new THREE.Color(0x8fb8de);
+scene.background = NIGHT_SKY.clone();
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 200);
+camera.position.set(5.5, 13, 16);
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.target.set(5.5, 0, 4);
+controls.maxPolarAngle = Math.PI * 0.47;
+controls.enableDamping = true;
+controls.update();
+
+const hemi = new THREE.HemisphereLight(0x8090b0, 0x202020, 0.12);  // faint moonlight so the house is never pitch black
+scene.add(hemi);
+
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(80, 80), new THREE.MeshStandardMaterial({ color: 0x1a1f1a }));
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = -0.02;
+ground.receiveShadow = true;
+scene.add(ground);
+
+const wallMat = new THREE.MeshStandardMaterial({ color: 0xe9e4da, roughness: 0.9 });
+function box(w, h, d, x, y, z, mat = wallMat) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  m.position.set(x, y, z);
+  m.castShadow = m.receiveShadow = true;
+  scene.add(m);
+  return m;
+}
+
+// Axis-aligned wall from (x0,z0) to (x1,z1) with openings [from, to, sill, head] measured along the wall.
+const windowPanes = [];
+const glassMat = new THREE.MeshStandardMaterial({ color: 0x223344, emissive: 0x9cc8ff, emissiveIntensity: 0, transparent: true, opacity: 0.55 });
+function wall(x0, z0, x1, z1, openings = []) {
+  const alongX = z0 === z1, len = alongX ? x1 - x0 : z1 - z0;
+  const place = (a, b, y0, y1) => {
+    if (b - a < 1e-3 || y1 - y0 < 1e-3) return;
+    const mid = (a + b) / 2, w = b - a, h = y1 - y0, y = (y0 + y1) / 2;
+    if (alongX) box(w, h, T, x0 + mid, y, z0); else box(T, h, w, x0, y, z0 + mid);
+  };
+  let cursor = 0;
+  for (const [a, b, sill, head] of [...openings].sort((p, q) => p[0] - q[0])) {
+    place(cursor, a, 0, H);
+    place(a, b, 0, sill);       // below a window
+    place(a, b, head, H);       // lintel
+    if (sill > 0) {             // window glass
+      const mid = (a + b) / 2, pane = alongX
+        ? box(b - a, head - sill, 0.03, x0 + mid, (sill + head) / 2, z0, glassMat)
+        : box(0.03, head - sill, b - a, x0, (sill + head) / 2, z0 + mid, glassMat);
+      pane.castShadow = false;
+      windowPanes.push(pane);
+    }
+    cursor = b;
+  }
+  place(cursor, len, 0, H);
+}
+const DOOR = (a, b) => [a, b, 0, 2.1];
+const WIN = (a, b) => [a, b, 0.9, 2.1];
+
+wall(0, 0, 0, 4.5, [WIN(1.4, 3.1)]);                 // bedroom west (window)
+wall(0, 0, 4, 0);                                    // bedroom north
+wall(0, 4.5, 4, 4.5);                                // bedroom south
+wall(4, 0, 4, 8, [DOOR(3.0, 3.9)]);                  // bedroom | hallway
+wall(4, 0, 5.6, 0);                                  // hallway north
+wall(4, 8, 5.6, 8, [DOOR(0.4, 1.2)]);                // front door
+wall(5.6, 0, 5.6, 8, [DOOR(1.0, 1.9)]);              // hallway | living
+wall(5.6, 0, 11, 0);                                 // living north
+wall(11, 0, 11, 6, [WIN(1.0, 5.0)]);                 // living east (big window)
+wall(5.6, 6, 11, 6, [WIN(1.5, 4.0)]);                // living south (window)
+
+// Per room: floor, ceiling lamp, and a cool "window light" standing in for daylight.
+const roomViz = {};
+for (const [name, r] of Object.entries(ROOMS)) {
+  const w = r.x1 - r.x0, d = r.z1 - r.z0, cx = (r.x0 + r.x1) / 2, cz = (r.z0 + r.z1) / 2;
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(w, d), new THREE.MeshStandardMaterial({ color: r.floor, roughness: 0.8 }));
+  floor.rotation.x = -Math.PI / 2;
+  floor.position.set(cx, 0.001, cz);
+  floor.receiveShadow = true;
+  scene.add(floor);
+
+  // Invisible ceiling: blocks light from leaking over the walls but does not hide the interior.
+  const ceil = new THREE.Mesh(new THREE.BoxGeometry(w, 0.05, d), new THREE.MeshBasicMaterial({ colorWrite: false, depthWrite: false }));
+  ceil.position.set(cx, H + 0.03, cz);
+  ceil.castShadow = true;
+  scene.add(ceil);
+
+  const lamp = new THREE.PointLight(0xffd29a, 0, 10, 2);
+  lamp.position.set(cx, H - 0.25, cz);
+  lamp.castShadow = true;
+  lamp.shadow.mapSize.set(512, 512);
+  lamp.shadow.bias = -0.004;
+  scene.add(lamp);
+  const bulbMat = new THREE.MeshStandardMaterial({ color: 0x444444, emissive: 0xffd29a, emissiveIntensity: 0 });
+  const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.13, 16, 12), bulbMat);
+  bulb.position.copy(lamp.position);
+  scene.add(bulb);
+
+  const day = new THREE.PointLight(0xcfe2ff, 0, 12, 2);
+  const [wx, wy, wz] = r.win || [cx, H - 0.3, cz];
+  day.position.set(wx, wy, wz);
+  day.castShadow = true;
+  day.shadow.mapSize.set(512, 512);
+  day.shadow.bias = -0.004;
+  scene.add(day);
+
+  roomViz[name] = { lamp, bulbMat, day, lampTarget: 0, dayTarget: 0 };
+}
+
+// ---------------------------------------------------------------- occupant
+const person = new THREE.Group();
+const personMat = new THREE.MeshStandardMaterial({ color: 0x4fb3e8, roughness: 0.6 });
+const body = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.24, 1.15, 16), personMat);
+body.position.y = 0.58;
+const head = new THREE.Mesh(new THREE.SphereGeometry(0.17, 16, 12), personMat);
+head.position.y = 1.35;
+for (const m of [body, head]) { m.castShadow = true; person.add(m); }
+person.position.set(...xz(ROOMS.bedroom.spot));
+scene.add(person);
+
+function xz([x, z]) { return [x, 0, z]; }
+function placeOf(room) { return room === "away" ? AWAY : ROOMS[room]; }
+
+let personRoom = "bedroom";
+const path = [];                        // queue of [x, z] waypoints
+function moveTo(room) {
+  if (!placeOf(room) || room === personRoom) return;
+  const from = placeOf(personRoom), to = placeOf(room);
+  path.length = 0;
+  if (from.door) path.push(from.door);  // leave through own door into the hallway...
+  if (to.door) path.push(to.door);      // ...and enter the target through its door
+  path.push(to.spot);
+  personRoom = room;
+}
+
+// ---------------------------------------------------------------- state from MQTT
+const state = { t: null, outdoor: 0, lux: {}, light: {} };
+const roomsTable = document.getElementById("rooms");
+function renderHud() {
+  document.getElementById("clock").textContent =
+    state.t == null ? "--:--:--" : new Date(state.t * 1000).toLocaleTimeString("zh-CN", { hour12: false });
+  document.getElementById("outdoor").textContent = Math.round(state.outdoor);
+  document.getElementById("where").textContent = personRoom === "away" ? "外出" : ROOMS[personRoom].label;
+  roomsTable.innerHTML = Object.entries(ROOMS).map(([name, r]) => {
+    const l = state.light[name], lux = state.lux[name];
+    const cell = l && l.on ? `<td class="on">亮 ${Math.round(l.brightness / 2.55)}%</td>` : `<td class="off">灭</td>`;
+    return `<tr><td>${r.label}</td>${cell}<td>${lux == null ? "–" : Math.round(lux)} lx</td></tr>`;
+  }).join("");
+}
+
+const broker = new URLSearchParams(location.search).get("broker") || "ws://localhost:9001";
+const conn = document.getElementById("conn");
+const client = mqtt.connect(broker, { reconnectPeriod: 2000, connectTimeout: 4000 });
+client.on("connect", () => {
+  conn.className = "ok"; conn.textContent = broker;
+  client.subscribe(["home/+/light/state", "home/+/lux", "sim/time", "sim/occupant", "sim/ambient"]);
+});
+client.on("offline", () => { conn.className = "bad"; conn.textContent = `连不上 ${broker}（docker compose up -d 了吗？）`; });
+client.on("message", (topic, buf) => {
+  let p;
+  try { p = JSON.parse(buf.toString()); } catch { return; }
+  const parts = topic.split("/");
+  if (topic === "sim/time") state.t = p.t;
+  else if (topic === "sim/occupant") moveTo(p.room);
+  else if (topic === "sim/ambient") {
+    state.outdoor = p.outdoor;
+    for (const [room, lux] of Object.entries(p.rooms || {})) if (roomViz[room]) roomViz[room].dayTarget = lux * DAYLIGHT_SCALE;
+  } else if (parts[0] === "home" && roomViz[parts[1]]) {
+    const room = parts[1];
+    if (parts[2] === "lux") state.lux[room] = p.lux;
+    else if (parts[2] === "light") {
+      state.light[room] = p;
+      roomViz[room].lampTarget = p.on ? (p.brightness / 255) * LAMP_MAX : 0;
+    }
+  }
+});
+
+// ---------------------------------------------------------------- loop
+const clock = new THREE.Clock();
+let hudTimer = 0;
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.1);
+  const k = 1 - Math.exp(-dt * 8);     // ~0.1 s fade, like a real dimmer
+
+  for (const v of Object.values(roomViz)) {
+    v.lamp.intensity += (v.lampTarget - v.lamp.intensity) * k;
+    v.bulbMat.emissiveIntensity = v.lamp.intensity / LAMP_MAX * 2.5;
+    v.day.intensity += (v.dayTarget - v.day.intensity) * k;
+  }
+  const sun = Math.min(state.outdoor / 600, 1);
+  scene.background.copy(NIGHT_SKY).lerp(DAY_SKY, sun);
+  hemi.intensity = 0.12 + 0.25 * sun;
+  glassMat.emissiveIntensity = 0.05 + 0.9 * sun;
+
+  if (path.length) {                   // walk faster when the occupant is far behind the simulation
+    const [tx, tz] = path[0], dx = tx - person.position.x, dz = tz - person.position.z;
+    const dist = Math.hypot(dx, dz), step = dt * (3 + 3 * path.length);
+    if (dist <= step) { person.position.set(tx, 0, tz); path.shift(); }
+    else { person.position.x += dx / dist * step; person.position.z += dz / dist * step; person.rotation.y = Math.atan2(dx, dz); }
+  }
+  person.visible = !(personRoom === "away" && !path.length);
+
+  if ((hudTimer += dt) > 0.1) { hudTimer = 0; renderHud(); }
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>

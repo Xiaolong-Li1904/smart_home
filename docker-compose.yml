@@ -6,5 +6,6 @@ services:
     ports:
       # Localhost only for now. Real ESP32 nodes will need 0.0.0.0 plus a password (see mosquitto.conf).
       - "127.0.0.1:1883:1883"
+      - "127.0.0.1:9001:9001"  # MQTT over WebSocket, for the browser viewer
     volumes:
       - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro

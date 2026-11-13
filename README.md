@@ -19,6 +19,8 @@
 | `home/<room>/light/set` | 控制器 → 节点 | `{"on": bool, "brightness": 0-255}` |
 | `home/<room>/light/state` | 节点 → 控制器 | `{"on": bool, "brightness": 0-255}`（retained） |
 | `sim/time` | 仿真器 → 全部 | `{"t": unix 秒}`，仅在仿真时间下使用 |
+| `sim/occupant` | 仿真器 → 渲染页 | `{"room": ...}`，真值，控制器不能读 |
+| `sim/ambient` | 仿真器 → 渲染页 | `{"outdoor": lx, "rooms": {...}}`，真值，控制器不能读 |
 
 ## 安装
 
@@ -45,6 +47,8 @@ docker compose up -d                                          # 启动 Mosquitto
 ```
 
 `--speed 60` 表示 1 秒现实时间对应 1 分钟仿真时间。
+
+**3D 渲染**：用浏览器直接打开 [web/index.html](web/index.html)（双击即可），它通过 WebSocket（`ws://localhost:9001`）连接 Mosquitto，显示户型、灯光、自然光和住户位置。页面只订阅、不发命令，所以不影响控制逻辑；接真实硬件时也能用，只是没有住户和自然光（那两个是仿真器才有的 `sim/` 主题）。
 
 **测试**：
 

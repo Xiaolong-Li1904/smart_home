@@ -7,6 +7,11 @@ Every payload is a JSON object.
     home/<room>/light/set     controller -> node   {"on": bool, "brightness": 0-255}  (brightness optional)
     home/<room>/light/state   node -> controller   {"on": bool, "brightness": 0-255}  (retained)
     sim/time                  simulator -> all     {"t": unix seconds}  (only when running on simulated time)
+
+Ground truth for visualization only; the controller must never read these (real hardware has no such topics):
+
+    sim/occupant              simulator -> viewer  {"room": "bedroom" | "living" | "hallway" | "away"}  (retained)
+    sim/ambient               simulator -> viewer  {"outdoor": lux, "rooms": {room: daylight lux}}       (retained)
 """
 
 from __future__ import annotations
@@ -16,6 +21,8 @@ from datetime import datetime
 ROOMS = ("hallway", "living", "bedroom")
 
 SIM_TIME = "sim/time"
+SIM_OCCUPANT = "sim/occupant"
+SIM_AMBIENT = "sim/ambient"
 
 
 def motion_topic(room: str) -> str:
